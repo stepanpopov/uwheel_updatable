@@ -82,6 +82,10 @@ macro_rules! sum_impl {
             fn combine_simd() -> Option<fn(&[Self::PartialAggregate]) -> Self::PartialAggregate> {
                 Some(|slice: &[$pa]| Self::simd_sum(slice))
             }
+
+            fn update_support() -> bool {
+                true
+            }
         }
         impl $struct {
             #[cfg(feature = "simd")]

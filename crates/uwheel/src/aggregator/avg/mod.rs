@@ -51,6 +51,10 @@ macro_rules! avg_impl {
                     (inv_sum, inv_count)
                 })
             }
+
+            fn update_support() -> bool {
+                true
+            }
         }
     };
 }

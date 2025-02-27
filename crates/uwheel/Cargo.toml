@@ -37,6 +37,8 @@ profiler = ["dep:uwheel-stats", "prettytable-rs", "std"]
 timer = []
 
 [dependencies]
+anyhow = "1.0.72"
+
 time = { workspace = true, default-features = false }
 
 # Optional

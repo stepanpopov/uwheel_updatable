@@ -2,6 +2,7 @@ use crate::{aggregator::Aggregator, duration::Duration};
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
+use anyhow::Ok;
 use core::{
     assert,
     fmt::Debug,
@@ -10,6 +11,7 @@ use core::{
     ops::{Range, RangeBounds},
     option::Option::{self, None, Some},
 };
+use time::OffsetDateTime;
 
 #[cfg(feature = "profiler")]
 use uwheel_stats::profile_scope;
@@ -35,6 +37,8 @@ use self::{
     conf::{DataLayout, RetentionPolicy, WheelConf, WheelMode},
     data::Data,
 };
+
+use super::hierarchical::Granularity;
 
 /// Combine partial aggregates or insert new entry
 #[inline]
@@ -162,6 +166,20 @@ impl<A: Aggregator> Wheel<A> {
             total_ticks: 0,
             #[cfg(feature = "profiler")]
             stats: Stats::default(),
+        }
+    }
+
+    /// Maybe init all slots and total.
+    pub fn maybe_init(&mut self) {
+        let capacity = self.capacity.get();
+        let cur_slots = self.data.len();
+
+        if capacity > cur_slots {
+            let slots_to_init = capacity - cur_slots;
+            self.data.init_slots_default(slots_to_init);
+            if self.total.is_none() {
+                self.total = Some(A::PartialAggregate::default());
+            }
         }
     }
 
@@ -417,6 +435,94 @@ impl<A: Aggregator> Wheel<A> {
         self.data.merge(&other.data);
     }
 
+    /// Calculate slot for update
+    fn calcualte_slot_idx_for_update(
+        &self,
+        wheels_watermark: OffsetDateTime,
+        ts_offset_date: OffsetDateTime,
+    ) -> Option<u64> {
+        assert!(wheels_watermark >= ts_offset_date);
+        let distance = wheels_watermark - ts_offset_date;
+
+        let dist_whole_sec = distance.whole_seconds();
+        assert!(dist_whole_sec >= 0);
+
+        let slot_idx = dist_whole_sec as u64 / self.tick_size_sec();
+
+        // TODO: maybe check earlier.
+        if slot_idx >= self.data.len() as u64 {
+            None
+        } else {
+            Some(slot_idx)
+        }
+    }
+
+    /// Insert.
+    /// Returns false if entry is too old.
+    pub fn insert(
+        &mut self,
+        ts_offset_date: OffsetDateTime,
+        new_entry: A::Input,
+    ) -> anyhow::Result<bool> {
+        let aggr = A::freeze(A::lift(new_entry));
+        Ok(self.update_inner(ts_offset_date, aggr))
+    }
+
+    /// Update.
+    /// Returns false if entry is too old.
+    pub fn update(
+        &mut self,
+        ts_offset_date: OffsetDateTime,
+        delta_entry: A::PartialAggregate,
+    ) -> anyhow::Result<bool> {
+        if A::update_support() {
+            Ok(self.update_inner(ts_offset_date, delta_entry))
+        } else {
+            panic!("this aggregate dont support update")
+        }
+    }
+
+    /// Update.
+    #[warn(private_interfaces)]
+    fn update_inner(
+        &mut self,
+        ts_offset_date: OffsetDateTime,
+        delta_entry: A::PartialAggregate,
+    ) -> bool {
+        let wt_offset_date = Self::to_offset_date(self.watermark);
+        assert!(wt_offset_date >= ts_offset_date);
+
+        if let Some(slot_idx) =
+            self.calcualte_slot_idx_for_update(Self::to_offset_date(self.watermark), ts_offset_date)
+        {
+            self.update_slot(slot_idx as usize, delta_entry);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Update slot.
+    /// Data insert - new value.
+    /// Data update - delta between new and old.
+    fn update_slot(&mut self, slot: usize, delta_entry: A::PartialAggregate) {
+        self.maybe_init();
+
+        let slot_data = self.data.get_mut(slot);
+
+        if let Some(old) = slot_data {
+            *old = A::combine(*old, delta_entry);
+
+            if let Some(total) = &mut self.total {
+                *total = A::combine(*total, delta_entry);
+            } else {
+                panic!("total should already be initialized");
+            }
+        } else {
+            panic!("slot should already be initialized");
+        }
+    }
+
     /// Tick the wheel by 1 slot
     #[inline]
     pub fn tick(&mut self) -> Option<WheelSlot<A>> {
@@ -453,10 +559,21 @@ impl<A: Aggregator> Wheel<A> {
         }
     }
 
+    #[inline]
+    fn to_offset_date(ts: u64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(ts as i64 / 1000).unwrap()
+    }
+
     /// Check whether this wheel is utilising all its slots
     #[inline]
     pub fn is_full(&self) -> bool {
         self.data.len() >= self.capacity.get()
+    }
+
+    /// Returs tick size in seconds.
+    #[inline]
+    pub fn tick_size_sec(&self) -> u64 {
+        self.tick_size_ms / 1000
     }
 
     #[cfg(feature = "profiler")]

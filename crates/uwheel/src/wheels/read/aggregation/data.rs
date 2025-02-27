@@ -56,6 +56,27 @@ impl<A: Aggregator> Data<A> {
             Data::CompressedDeque(arr) => arr.len(),
         }
     }
+
+    pub fn init_slots_default(&mut self, slots_num: usize) {
+        match self {
+            Data::Deque(arr) => {
+                for _ in 0..slots_num {
+                    arr.push_front(A::PartialAggregate::default());
+                }
+            }
+            Data::PrefixDeque(parr) => {
+                for _ in 0..slots_num {
+                    parr.push_front(A::PartialAggregate::default());
+                }
+            }
+            Data::CompressedDeque(arr) => {
+                for _ in 0..slots_num {
+                    arr.push_front(A::PartialAggregate::default());
+                }
+            }
+        }
+    }
+
     #[inline]
     pub fn push_front(&mut self, agg: A::PartialAggregate) {
         match self {
@@ -84,6 +105,15 @@ impl<A: Aggregator> Data<A> {
         match (self, other) {
             (Data::Deque(arr), Data::Deque(arr_other)) => arr.merge(arr_other),
             _ => unimplemented!("Only Deque Merging supported as of now"),
+        }
+    }
+
+    // TODO: impl get mut for all Data deques.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut A::PartialAggregate> {
+        match self {
+            Data::Deque(arr) => arr.get_mut(index),
+            Data::PrefixDeque(parr) => unimplemented!(),
+            Data::CompressedDeque(arr) => unimplemented!(),
         }
     }
 

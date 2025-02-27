@@ -211,6 +211,11 @@ pub trait Aggregator: Default + Debug + Clone + 'static {
     fn compression_support() -> bool {
         Self::compression().is_some()
     }
+
+    #[doc(hidden)]
+    fn update_support() -> bool {
+        false
+    }
 }
 
 /// Defines how partial aggregates are to be compressed and decompressed
