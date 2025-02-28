@@ -499,6 +499,22 @@ where
         }
     }
 
+    /// Creates a new Wheel from the given configuration
+    pub fn new_with_full_cycle(conf: HawConf) -> Self {
+        let mut haw = Self::new(conf);
+        haw.rotate_full_cycle();
+        haw
+    }
+
+    fn rotate_full_cycle(&mut self) {
+        self.seconds_wheel.get_or_insert().maybe_init();
+        self.minutes_wheel.get_or_insert().maybe_init();
+        self.hours_wheel.get_or_insert().maybe_init();
+        self.days_wheel.get_or_insert().maybe_init();
+        self.weeks_wheel.get_or_insert().maybe_init();
+        self.years_wheel.get_or_insert().maybe_init();
+    }
+
     #[doc(hidden)]
     pub fn set_optimizer_hints(&mut self, hints: bool) {
         self.conf.optimizer.use_hints = hints;
