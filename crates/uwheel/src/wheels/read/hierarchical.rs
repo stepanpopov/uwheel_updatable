@@ -2401,4 +2401,15 @@ mod tests {
             haw.range(range);
         }
     }
+
+    // #[test]
+    // fn test_update() {
+    //     let watermark = 1699488000000; // 2023-11-09 00:00:00
+    //     let conf = HawConf::default().with_watermark(watermark);
+    //     let mut haw: Haw<U64SumAggregator> = Haw::new_with_full_cycle(conf);
+
+    //     // let d_iter = std::iter::repeat().take(3);
+    //     haw.
+    //     haw.delta_advance(d_iter.into());
+    // }
 }
