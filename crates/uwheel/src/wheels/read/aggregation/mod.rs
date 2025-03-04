@@ -357,6 +357,43 @@ impl<A: Aggregator> Wheel<A> {
         self.combine_range(range).map(A::lower)
     }
 
+    /// .
+    // pub fn combine_time_range(
+    //     &self,
+    //     (start, end): (OffsetDateTime, OffsetDateTime),
+    // ) -> anyhow::Result<Option<A::PartialAggregate>> {
+    //     let r = self.time_range((start, end))?;
+    //     dbg!(&r);
+    //     Ok(self.combine_range(r.0..r.1))
+    // }
+
+    /// [start; end) (ts in seconds)
+    /// end should be == cur_ts
+    // pub fn time_ts_range(&self, (start, end): (u64, u64)) -> anyhow::Result<(usize, usize)> {
+    //     let wm = Self::to_offset_date(self.watermark);
+
+    //     if wm < end {
+    //         return Err(anyhow!("wm < end"));
+    //     }
+
+    //     if start >= end {
+    //         return Err(anyhow!("start > end"));
+    //     }
+
+    //     // let distance = end - start;
+    //     // let slots_num = distance.whole_seconds() as u64 / self.tick_size_sec();
+
+    //     // if self.capacity.get() as u64 > slots_num {
+    //     //     return Err(anyhow!("ts higher than watermark"));
+    //     //     // return Err(anyhow!("self.capacity > slots_num"));
+    //     // }
+
+    //     // let start_slot_idx = (wm - end).whole_seconds() as u64 / self.tick_size_sec();
+    //     // let end_slot_idx = start_slot_idx + slots_num + 1;
+
+    //     // Ok((start_slot_idx as usize, end_slot_idx as usize))
+    // }
+
     /// Shift the tail and clear any old entry
     #[inline]
     fn clear_tail(&mut self) {
@@ -454,12 +491,12 @@ impl<A: Aggregator> Wheel<A> {
         wheels_watermark: OffsetDateTime,
         ts_offset_date: OffsetDateTime,
     ) -> Option<u64> {
-        assert!(wheels_watermark >= ts_offset_date);
+        assert!(wheels_watermark > ts_offset_date);
         let distance = wheels_watermark - ts_offset_date;
 
         let dist_whole_sec = distance.whole_seconds();
         assert!(dist_whole_sec >= 0);
-        dbg!(dist_whole_sec);
+        // dbg!(dist_whole_sec);
 
         let slot_idx = dist_whole_sec as u64 / self.tick_size_sec();
         dbg!(slot_idx);
@@ -506,10 +543,9 @@ impl<A: Aggregator> Wheel<A> {
     ) -> anyhow::Result<bool> {
         let wt_offset_date = Self::to_offset_date(self.watermark);
 
-        if wt_offset_date < ts_offset_date {
-            return Err(anyhow!("ts higher than watermark"));
+        if wt_offset_date <= ts_offset_date {
+            return Err(anyhow!("ts not less than watermark"));
         }
-        assert!(wt_offset_date >= ts_offset_date);
 
         let updated = if let Some(slot_idx) =
             self.calcualte_slot_idx_for_update(Self::to_offset_date(self.watermark), ts_offset_date)
@@ -875,6 +911,8 @@ mod tests {
         wheel.insert_head_tick(10);
         wheel.insert_head_tick(10);
 
+        dbg!(wheel.range(0..5));
+
         assert!(wheel.total().unwrap() == 20);
 
         dbg!(wheel.watermark());
@@ -889,25 +927,28 @@ mod tests {
         }
 
         {
-            wheel.insert(ms_to_odt(wheel.watermark()), 10).unwrap();
+            let err_str = wheel
+                .insert(ms_to_odt(wheel.watermark()), 10)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(err_str == "ts not less than watermark");
 
-            assert!(wheel.total().unwrap() == 35);
-        }
-
-        {
-            let err_s = wheel
+            let err_str = wheel
                 .insert(ms_to_odt(wheel.watermark() + 1000), 10)
                 .err()
                 .unwrap()
                 .to_string();
 
-            assert!(&err_s == "ts higher than watermark");
+            assert!(&err_str == "ts not less than watermark");
         }
 
         {
-            wheel.insert(ms_to_odt(wheel.watermark() + 1), 10).unwrap();
+            wheel
+                .insert(ms_to_odt(wheel.watermark() - 1000), 10)
+                .unwrap();
 
-            assert!(wheel.total().unwrap() == 45);
+            assert!(wheel.total().unwrap() == 35);
         }
 
         {
@@ -915,7 +956,7 @@ mod tests {
                 .update(ms_to_odt(wheel.watermark() - 1000), 5)
                 .unwrap();
 
-            assert!(wheel.total().unwrap() == 50);
+            assert!(wheel.total().unwrap() == 40);
         }
 
         for i in 0..60 {
@@ -952,16 +993,6 @@ mod tests {
             let res = wheel.range(0..3);
             dbg!(&res);
             assert!(res == vec![8, 10, 15]);
-        }
-
-        {
-            wheel.insert(ms_to_odt(3600000 * 2 - 1000), 10).unwrap();
-
-            assert!(wheel.total().unwrap() == 43);
-
-            let res = wheel.range(0..3);
-            dbg!(&res);
-            assert!(res == vec![8, 20, 15]);
         }
 
         {
@@ -1031,4 +1062,35 @@ mod tests {
             assert!(res == vec![10, 0, 0]);
         }
     }
+
+    // #[test]
+    // pub fn test_time_range() {
+    //     let start_watermark = 0;
+
+    //     let ms_to_odt = |wm: u64| OffsetDateTime::from_unix_timestamp(wm as i64 / 1000).unwrap();
+
+    //     let new_wheel = || {
+    //         let conf = WheelConf::new(HOUR_TICK_MS, NonZeroUsize::new(24).unwrap())
+    //             .with_retention_policy(RetentionPolicy::Drop)
+    //             .with_watermark(start_watermark);
+    //         Wheel::<U64SumAggregator>::new_with_init(conf)
+    //     };
+
+    //     {
+    //         let mut wheel = new_wheel();
+    //         wheel.insert_head_tick(10);
+    //         wheel.insert_head_tick(15);
+    //         wheel.insert_head_tick(20);
+
+    //         let res = wheel.maybe_advance_to(ms_to_odt(HOUR_TICK_MS * 3)).unwrap();
+    //         assert!(res == false);
+
+    //         let res = wheel
+    //             .combine_time_range((ms_to_odt(1000), ms_to_odt(HOUR_TICK_MS * 2)))
+    //             .unwrap()
+    //             .unwrap();
+    //         dbg!(&res);
+    //         assert!(res == 10);
+    //     }
+    // }
 }
