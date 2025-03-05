@@ -2,6 +2,7 @@ use crate::{aggregator::Aggregator, duration::Duration};
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
+use anyhow::{anyhow, Ok};
 use core::{
     assert,
     fmt::Debug,
@@ -10,6 +11,7 @@ use core::{
     ops::{Range, RangeBounds},
     option::Option::{self, None, Some},
 };
+use time::OffsetDateTime;
 
 #[cfg(feature = "profiler")]
 use uwheel_stats::profile_scope;
@@ -35,6 +37,8 @@ use self::{
     conf::{DataLayout, RetentionPolicy, WheelConf, WheelMode},
     data::Data,
 };
+
+use super::hierarchical::Granularity;
 
 /// Combine partial aggregates or insert new entry
 #[inline]
@@ -162,6 +166,27 @@ impl<A: Aggregator> Wheel<A> {
             total_ticks: 0,
             #[cfg(feature = "profiler")]
             stats: Stats::default(),
+        }
+    }
+
+    /// .
+    pub fn new_with_init(conf: WheelConf) -> Self {
+        let mut w = Self::new(conf);
+        w.maybe_init();
+        w
+    }
+
+    /// Maybe init all slots and total.
+    pub fn maybe_init(&mut self) {
+        let capacity = self.capacity.get();
+        let cur_slots = self.data.len();
+
+        if capacity > cur_slots {
+            let slots_to_init = capacity - cur_slots;
+            self.data.init_slots_default(slots_to_init);
+            if self.total.is_none() {
+                self.total = Some(A::PartialAggregate::default());
+            }
         }
     }
 
@@ -332,6 +357,43 @@ impl<A: Aggregator> Wheel<A> {
         self.combine_range(range).map(A::lower)
     }
 
+    /// .
+    // pub fn combine_time_range(
+    //     &self,
+    //     (start, end): (OffsetDateTime, OffsetDateTime),
+    // ) -> anyhow::Result<Option<A::PartialAggregate>> {
+    //     let r = self.time_range((start, end))?;
+    //     dbg!(&r);
+    //     Ok(self.combine_range(r.0..r.1))
+    // }
+
+    /// [start; end) (ts in seconds)
+    /// end should be == cur_ts
+    // pub fn time_ts_range(&self, (start, end): (u64, u64)) -> anyhow::Result<(usize, usize)> {
+    //     let wm = Self::to_offset_date(self.watermark);
+
+    //     if wm < end {
+    //         return Err(anyhow!("wm < end"));
+    //     }
+
+    //     if start >= end {
+    //         return Err(anyhow!("start > end"));
+    //     }
+
+    //     // let distance = end - start;
+    //     // let slots_num = distance.whole_seconds() as u64 / self.tick_size_sec();
+
+    //     // if self.capacity.get() as u64 > slots_num {
+    //     //     return Err(anyhow!("ts higher than watermark"));
+    //     //     // return Err(anyhow!("self.capacity > slots_num"));
+    //     // }
+
+    //     // let start_slot_idx = (wm - end).whole_seconds() as u64 / self.tick_size_sec();
+    //     // let end_slot_idx = start_slot_idx + slots_num + 1;
+
+    //     // Ok((start_slot_idx as usize, end_slot_idx as usize))
+    // }
+
     /// Shift the tail and clear any old entry
     #[inline]
     fn clear_tail(&mut self) {
@@ -381,6 +443,12 @@ impl<A: Aggregator> Wheel<A> {
         self.total
     }
 
+    /// Insert PartialAggregate into the head of the wheel and tick.
+    pub fn insert_head_tick(&mut self, entry: A::PartialAggregate) -> Option<WheelSlot<A>> {
+        self.insert_head(entry);
+        self.tick()
+    }
+
     /// Insert PartialAggregate into the head of the wheel
     #[inline]
     pub fn insert_head(&mut self, entry: A::PartialAggregate) {
@@ -415,6 +483,123 @@ impl<A: Aggregator> Wheel<A> {
         }
 
         self.data.merge(&other.data);
+    }
+
+    /// Calculate slot for update
+    fn calcualte_slot_idx_for_update(
+        &self,
+        wheels_watermark: OffsetDateTime,
+        ts_offset_date: OffsetDateTime,
+    ) -> Option<u64> {
+        assert!(wheels_watermark > ts_offset_date);
+        let distance = wheels_watermark - ts_offset_date;
+
+        let dist_whole_sec = distance.whole_seconds();
+        assert!(dist_whole_sec >= 0);
+        // dbg!(dist_whole_sec);
+
+        let slot_idx = dist_whole_sec as u64 / self.tick_size_sec();
+        dbg!(slot_idx);
+
+        // TODO: maybe check earlier.
+        if slot_idx >= self.data.len() as u64 {
+            None
+        } else {
+            Some(slot_idx)
+        }
+    }
+
+    /// Insert.
+    /// Returns false if entry is too old.
+    pub fn insert(
+        &mut self,
+        ts_offset_date: OffsetDateTime,
+        new_entry: A::Input,
+    ) -> anyhow::Result<bool> {
+        let aggr = A::freeze(A::lift(new_entry));
+        self.update_inner(ts_offset_date, aggr)
+    }
+
+    /// Update.
+    /// Returns false if entry is too old.
+    pub fn update(
+        &mut self,
+        ts_offset_date: OffsetDateTime,
+        delta_entry: A::PartialAggregate,
+    ) -> anyhow::Result<bool> {
+        if A::update_support() {
+            self.update_inner(ts_offset_date, delta_entry)
+        } else {
+            panic!("this aggregate dont support update")
+        }
+    }
+
+    /// Update.
+    #[warn(private_interfaces)]
+    fn update_inner(
+        &mut self,
+        ts_offset_date: OffsetDateTime,
+        delta_entry: A::PartialAggregate,
+    ) -> anyhow::Result<bool> {
+        let wt_offset_date = Self::to_offset_date(self.watermark);
+
+        if wt_offset_date <= ts_offset_date {
+            return Err(anyhow!("ts not less than watermark"));
+        }
+
+        let updated = if let Some(slot_idx) =
+            self.calcualte_slot_idx_for_update(Self::to_offset_date(self.watermark), ts_offset_date)
+        {
+            self.update_slot(slot_idx as usize, delta_entry);
+            true
+        } else {
+            false
+        };
+
+        Ok(updated)
+    }
+
+    /// Update slot.
+    /// Data insert - new value.
+    /// Data update - delta between new and old.
+    fn update_slot(&mut self, slot: usize, delta_entry: A::PartialAggregate) {
+        self.maybe_init();
+
+        let slot_data = self.data.get_mut(slot);
+
+        if let Some(old) = slot_data {
+            *old = A::combine(*old, delta_entry);
+
+            if let Some(total) = &mut self.total {
+                *total = A::combine(*total, delta_entry);
+            } else {
+                panic!("total should already be initialized");
+            }
+        } else {
+            panic!("slot should already be initialized");
+        }
+    }
+
+    /// Advance before update and before select.
+    #[inline]
+    pub fn maybe_advance_to(&mut self, ts: OffsetDateTime) -> anyhow::Result<bool> {
+        let wm = Self::to_offset_date(self.watermark);
+        if ts <= wm {
+            return Ok(false);
+        }
+
+        let distance = ts - wm;
+        let full_rotation_num = distance.whole_seconds() / self.tick_size_sec() as i64;
+
+        if full_rotation_num == 0 {
+            return Ok(false);
+        }
+
+        for _ in 0..full_rotation_num {
+            self.insert_head_tick(A::PartialAggregate::default());
+        }
+
+        Ok(true)
     }
 
     /// Tick the wheel by 1 slot
@@ -453,10 +638,21 @@ impl<A: Aggregator> Wheel<A> {
         }
     }
 
+    #[inline]
+    fn to_offset_date(ts: u64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(ts as i64 / 1000).unwrap()
+    }
+
     /// Check whether this wheel is utilising all its slots
     #[inline]
     pub fn is_full(&self) -> bool {
         self.data.len() >= self.capacity.get()
+    }
+
+    /// Returs tick size in seconds.
+    #[inline]
+    pub fn tick_size_sec(&self) -> u64 {
+        self.tick_size_ms / 1000
     }
 
     #[cfg(feature = "profiler")]
@@ -700,4 +896,201 @@ mod tests {
         }
         assert_eq!(wheel.total_slots(), 24 + 10);
     }
+
+    #[test]
+    fn update_last_hour_test() {
+        let start_watermark = 0;
+
+        let ms_to_odt = |wm: u64| OffsetDateTime::from_unix_timestamp(wm as i64 / 1000).unwrap();
+
+        let conf = WheelConf::new(HOUR_TICK_MS, NonZeroUsize::new(24).unwrap())
+            .with_retention_policy(RetentionPolicy::Drop)
+            .with_watermark(start_watermark);
+        let mut wheel = Wheel::<U64SumAggregator>::new_with_init(conf);
+
+        wheel.insert_head_tick(10);
+        wheel.insert_head_tick(10);
+
+        dbg!(wheel.range(0..5));
+
+        assert!(wheel.total().unwrap() == 20);
+
+        dbg!(wheel.watermark());
+        assert!(wheel.watermark() == 7200000);
+
+        {
+            wheel
+                .insert(ms_to_odt(wheel.watermark() - 1000), 5)
+                .unwrap();
+
+            assert!(wheel.total().unwrap() == 25);
+        }
+
+        {
+            let err_str = wheel
+                .insert(ms_to_odt(wheel.watermark()), 10)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(err_str == "ts not less than watermark");
+
+            let err_str = wheel
+                .insert(ms_to_odt(wheel.watermark() + 1000), 10)
+                .err()
+                .unwrap()
+                .to_string();
+
+            assert!(&err_str == "ts not less than watermark");
+        }
+
+        {
+            wheel
+                .insert(ms_to_odt(wheel.watermark() - 1000), 10)
+                .unwrap();
+
+            assert!(wheel.total().unwrap() == 35);
+        }
+
+        {
+            wheel
+                .update(ms_to_odt(wheel.watermark() - 1000), 5)
+                .unwrap();
+
+            assert!(wheel.total().unwrap() == 40);
+        }
+
+        for i in 0..60 {
+            wheel.insert_slot(WheelSlot::with_total(Some(i)));
+            wheel.tick();
+        }
+    }
+
+    #[test]
+    fn update_older_hours_test() {
+        let start_watermark = 0;
+
+        let ms_to_odt = |wm: u64| OffsetDateTime::from_unix_timestamp(wm as i64 / 1000).unwrap();
+
+        let conf = WheelConf::new(HOUR_TICK_MS, NonZeroUsize::new(24).unwrap())
+            .with_retention_policy(RetentionPolicy::Drop)
+            .with_watermark(start_watermark);
+        let mut wheel = Wheel::<U64SumAggregator>::new_with_init(conf);
+
+        wheel.insert_head_tick(5);
+        wheel.insert_head_tick(10);
+        wheel.insert_head_tick(15);
+
+        assert!(wheel.total().unwrap() == 30);
+
+        dbg!(wheel.watermark());
+        assert!(wheel.watermark() == 3600000 * 3);
+
+        {
+            wheel.insert(ms_to_odt(1000), 3).unwrap();
+
+            assert!(wheel.total().unwrap() == 33);
+
+            let res = wheel.range(0..3);
+            dbg!(&res);
+            assert!(res == vec![8, 10, 15]);
+        }
+
+        {
+            wheel.insert(ms_to_odt(3600000 * 2 - 1000), 10).unwrap();
+
+            assert!(wheel.total().unwrap() == 43);
+
+            let res = wheel.range(0..3);
+            dbg!(&res);
+            assert!(res == vec![8, 20, 15]);
+        }
+    }
+
+    #[test]
+    fn test_advance_to() {
+        let start_watermark = 0;
+
+        let ms_to_odt = |wm: u64| OffsetDateTime::from_unix_timestamp(wm as i64 / 1000).unwrap();
+
+        let new_wheel = || {
+            let conf = WheelConf::new(HOUR_TICK_MS, NonZeroUsize::new(24).unwrap())
+                .with_retention_policy(RetentionPolicy::Drop)
+                .with_watermark(start_watermark);
+            Wheel::<U64SumAggregator>::new_with_init(conf)
+        };
+
+        {
+            let mut wheel = new_wheel();
+            wheel.insert_head_tick(10);
+
+            wheel.maybe_advance_to(ms_to_odt(HOUR_TICK_MS * 3)).unwrap();
+            dbg!(wheel.total().unwrap());
+            assert!(wheel.total().unwrap() == 10);
+
+            let res = wheel.range(0..3);
+            dbg!(&res);
+            assert!(res == vec![10, 0, 0]);
+        }
+
+        {
+            let mut wheel = new_wheel();
+            wheel.insert_head_tick(10);
+
+            wheel
+                .maybe_advance_to(ms_to_odt(HOUR_TICK_MS * 3 - 1000))
+                .unwrap();
+            dbg!(wheel.total().unwrap());
+            assert!(wheel.total().unwrap() == 10);
+
+            let res = wheel.range(0..2);
+            dbg!(&res);
+            assert!(res == vec![10, 0]);
+        }
+
+        {
+            let mut wheel = new_wheel();
+            wheel.insert_head_tick(10);
+
+            wheel
+                .maybe_advance_to(ms_to_odt(HOUR_TICK_MS * 3 + 1000))
+                .unwrap();
+            dbg!(wheel.total().unwrap());
+            assert!(wheel.total().unwrap() == 10);
+
+            let res = wheel.range(0..3);
+            dbg!(&res);
+            assert!(res == vec![10, 0, 0]);
+        }
+    }
+
+    // #[test]
+    // pub fn test_time_range() {
+    //     let start_watermark = 0;
+
+    //     let ms_to_odt = |wm: u64| OffsetDateTime::from_unix_timestamp(wm as i64 / 1000).unwrap();
+
+    //     let new_wheel = || {
+    //         let conf = WheelConf::new(HOUR_TICK_MS, NonZeroUsize::new(24).unwrap())
+    //             .with_retention_policy(RetentionPolicy::Drop)
+    //             .with_watermark(start_watermark);
+    //         Wheel::<U64SumAggregator>::new_with_init(conf)
+    //     };
+
+    //     {
+    //         let mut wheel = new_wheel();
+    //         wheel.insert_head_tick(10);
+    //         wheel.insert_head_tick(15);
+    //         wheel.insert_head_tick(20);
+
+    //         let res = wheel.maybe_advance_to(ms_to_odt(HOUR_TICK_MS * 3)).unwrap();
+    //         assert!(res == false);
+
+    //         let res = wheel
+    //             .combine_time_range((ms_to_odt(1000), ms_to_odt(HOUR_TICK_MS * 2)))
+    //             .unwrap()
+    //             .unwrap();
+    //         dbg!(&res);
+    //         assert!(res == 10);
+    //     }
+    // }
 }

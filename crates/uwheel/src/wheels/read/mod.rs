@@ -287,6 +287,20 @@ where
     pub fn as_ref(&self) -> HawRef<'_, A> {
         self.inner.read()
     }
+
+    /// Insert.
+    pub fn insert(&mut self, ts_seconds: u64, new_entry: A::Input) -> anyhow::Result<bool> {
+        self.inner.write().insert(ts_seconds, new_entry)
+    }
+
+    /// Update.
+    pub fn update(
+        &mut self,
+        ts_seconds: u64,
+        delta_entry: A::PartialAggregate,
+    ) -> anyhow::Result<bool> {
+        self.inner.write().update(ts_seconds, delta_entry)
+    }
 }
 
 impl<A: Aggregator> From<Haw<A>> for ReaderWheel<A> {

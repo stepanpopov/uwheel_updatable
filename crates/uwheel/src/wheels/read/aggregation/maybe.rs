@@ -178,6 +178,11 @@ impl<A: Aggregator> MaybeWheel<A> {
         self.inner.as_ref().map(|w| w.total_slots()).unwrap_or(0)
     }
 
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.inner.as_ref().map(|w| w.capacity.get()).unwrap_or(0)
+    }
+
     pub(crate) fn as_mut(&mut self) -> Option<&mut Wheel<A>> {
         self.inner.as_mut()
     }
@@ -190,6 +195,36 @@ impl<A: Aggregator> MaybeWheel<A> {
             let agg_wheel = Wheel::new(self.conf);
             self.inner = Some(agg_wheel);
         }
+        self.inner.as_mut().unwrap()
+    }
+
+    pub fn tick_size_ms(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .map(|wheel| wheel.tick_size_ms)
+            .unwrap_or(0)
+    }
+
+    pub fn rotations_ms(&self) -> u64 {
+        self.rotation_count() as u64 * self.tick_size_ms()
+    }
+
+    pub fn rotations_sec(&self) -> u64 {
+        self.rotations_ms() / 1000
+    }
+
+    pub fn last_ts_ms(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .map(|wheel| wheel.watermark - ((wheel.rotation_count - 1) as u64 * wheel.tick_size_ms))
+            .unwrap_or(0)
+    }
+
+    pub fn last_ts_sec(&self) -> u64 {
+        self.last_ts_ms() / 1000
+    }
+
+    pub fn unwrap_ref_mut(&mut self) -> &mut Wheel<A> {
         self.inner.as_mut().unwrap()
     }
 }

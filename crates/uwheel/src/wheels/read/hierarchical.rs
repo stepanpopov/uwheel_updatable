@@ -5,6 +5,8 @@ use core::{
 };
 use time::OffsetDateTime;
 
+use anyhow::anyhow;
+
 use super::{
     super::write::WriterWheel,
     aggregation::{
@@ -495,6 +497,22 @@ where
             #[cfg(feature = "profiler")]
             stats: Stats::default(),
         }
+    }
+
+    /// Creates a new Wheel from the given configuration
+    pub fn new_with_full_cycle(conf: HawConf) -> Self {
+        let mut haw = Self::new(conf);
+        haw.rotate_full_cycle();
+        haw
+    }
+
+    fn rotate_full_cycle(&mut self) {
+        self.seconds_wheel.get_or_insert().maybe_init();
+        self.minutes_wheel.get_or_insert().maybe_init();
+        self.hours_wheel.get_or_insert().maybe_init();
+        self.days_wheel.get_or_insert().maybe_init();
+        self.weeks_wheel.get_or_insert().maybe_init();
+        self.years_wheel.get_or_insert().maybe_init();
     }
 
     #[doc(hidden)]
@@ -1753,6 +1771,62 @@ where
         self.weeks_wheel.merge(&other.weeks_wheel);
         self.years_wheel.merge(&other.years_wheel);
     }
+
+    /// Insert.
+    pub fn insert(&mut self, ts_seconds: u64, new_entry: A::Input) -> anyhow::Result<bool> {
+        let (wheel_to_update, gran) = self.choose_wheel_for_update(ts_seconds as u64)?;
+        let ts_offset_date =
+            OffsetDateTime::from_unix_timestamp(ts_seconds as i64).map_err(|e| anyhow!(e))?;
+        wheel_to_update.insert(ts_offset_date, new_entry)
+    }
+
+    /// Update.
+    pub fn update(
+        &mut self,
+        ts_seconds: u64,
+        delta_entry: A::PartialAggregate,
+    ) -> anyhow::Result<bool> {
+        let (wheel_to_update, gran) = self.choose_wheel_for_update(ts_seconds as u64)?;
+        let ts_offset_date =
+            OffsetDateTime::from_unix_timestamp(ts_seconds as i64).map_err(|e| anyhow!(e))?;
+        wheel_to_update.update(ts_offset_date, delta_entry)
+    }
+
+    /// Panics: if no wheel contains ts_sec.
+    fn choose_wheel_for_update(
+        &mut self,
+        ts_seconds: u64,
+    ) -> anyhow::Result<(&mut Wheel<A>, Granularity)> {
+        let ts_offset_date =
+            OffsetDateTime::from_unix_timestamp(ts_seconds as i64).map_err(|e| anyhow!(e))?;
+
+        let watermark_ms = self.watermark;
+        let watermark_offset_date = Self::to_offset_date(watermark_ms);
+        assert!(watermark_offset_date >= ts_offset_date);
+
+        let wheel_start_ms =
+            watermark_ms.saturating_sub(self.current_time_in_cycle().whole_milliseconds() as u64);
+        let wheel_start_offset_date = Self::to_offset_date(wheel_start_ms);
+
+        if ts_offset_date < wheel_start_offset_date {
+            return Err(anyhow!("ts for update is lower than first wheel entry"));
+        }
+
+        if self.seconds_wheel.last_ts_sec() <= ts_seconds {
+            return Ok((self.seconds_wheel.unwrap_ref_mut(), Granularity::Second));
+        }
+
+        if self.minutes_wheel.last_ts_sec() <= ts_seconds {
+            return Ok((self.minutes_wheel.unwrap_ref_mut(), Granularity::Minute));
+        }
+
+        if self.hours_wheel.last_ts_sec() <= ts_seconds {
+            return Ok((self.hours_wheel.unwrap_ref_mut(), Granularity::Hour));
+        }
+
+        unreachable!("no wheel for update")
+    }
+
     #[cfg(feature = "profiler")]
     /// Returns a reference to the stats of the [Haw]
     pub fn stats(&self) -> &Stats {
@@ -2327,4 +2401,15 @@ mod tests {
             haw.range(range);
         }
     }
+
+    // #[test]
+    // fn test_update() {
+    //     let watermark = 1699488000000; // 2023-11-09 00:00:00
+    //     let conf = HawConf::default().with_watermark(watermark);
+    //     let mut haw: Haw<U64SumAggregator> = Haw::new_with_full_cycle(conf);
+
+    //     // let d_iter = std::iter::repeat().take(3);
+    //     haw.
+    //     haw.delta_advance(d_iter.into());
+    // }
 }
